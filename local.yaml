@@ -1,0 +1,44 @@
+hydra:
+  run:
+    dir: ./output/${parameters.model_name}_${parameters.batch_size}_${parameters.num_epochs}
+
+parameters:
+  data_dir: "../../data/"
+  resume: "Null"
+  ckpt_path: "ckpt"
+  logs_path: "log"
+  loss: "mse"
+  model_name: "UNet"
+  img_size: 256
+  num_epochs: 2000
+  batch_size: 2
+  num_workers: 12
+  lr_init: 1.e-3
+  lr_step: 25
+  lr_gamma: 0.5
+  random_seed: 100
+  verbose_step: 10
+  requires_grad: True
+  inference: False
+  optim_reset: False
+  channels: 1
+  scheduler: "step"
+  net_verbose: False
+  bilinear: True
+  min_std: 25.
+  max_std: 25.
+
+steplr:
+  step_size: 30
+  gamma: 0.5
+
+plateau:
+  mode: 'min' 
+  factor: 0.8
+  patience: 1
+  verbose: False
+  threshold: 0.0001
+  threshold_mode: 'abs'
+  cooldown: 0
+  min_lr: 5.e-6
+  eps: 1.e-8

@@ -1,131 +1,110 @@
-import gc
-import os
-import sys
+""" Parts of the U-Net model """
 
-import numpy as np
-import tensorflow as tf
-from PIL import Image
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-def data_augmentation(image, mode):
-    if mode == 0:
-        # original
-        return image
-    elif mode == 1:
-        # flip up and down
-        return np.flipud(image)
-    elif mode == 2:
-        # rotate counterwise 90 degree
-        return np.rot90(image)
-    elif mode == 3:
-        # rotate 90 degree and flip up and down
-        image = np.rot90(image)
-        return np.flipud(image)
-    elif mode == 4:
-        # rotate 180 degree
-        return np.rot90(image, k=2)
-    elif mode == 5:
-        # rotate 180 degree and flip
-        image = np.rot90(image, k=2)
-        return np.flipud(image)
-    elif mode == 6:
-        # rotate 270 degree
-        return np.rot90(image, k=3)
-    elif mode == 7:
-        # rotate 270 degree and flip
-        image = np.rot90(image, k=3)
-        return np.flipud(image)
+class DoubleConv(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
+
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
 
 
-class train_data():
-    def __init__(self, filepath='./data/image_clean_pat.npy'):
-        self.filepath = filepath
-        assert '.npy' in filepath
-        if not os.path.exists(filepath):
-            print("[!] Data file not exists")
-            sys.exit(1)
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
 
-    def __enter__(self):
-        print("[*] Loading data...")
-        self.data = np.load(self.filepath)
-        np.random.shuffle(self.data)
-        print("[*] Load successfully...")
-        return self.data
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
+        )
 
-    def __exit__(self, type, value, trace):
-        del self.data
-        gc.collect()
-        print("In __exit__()")
+    def forward(self, x):
+        return self.maxpool_conv(x)
 
 
-def load_data(filepath='./data/image_clean_pat.npy'):
-    return train_data(filepath=filepath)
+class Up(nn.Module):
+    """Upscaling then double conv"""
+
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+
+        # if bilinear, use the normal convolutions to reduce the number of channels
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels , in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
 
 
-def load_images(filelist):
-    # pixel value range 0-255
-    if not isinstance(filelist, list):
-        im = Image.open(filelist).convert('L')
-        return np.array(im).reshape(1, im.size[1], im.size[0], 1)
-    data = []
-    for file in filelist:
-        im = Image.open(file).convert('L')
-        data.append(np.array(im).reshape(1, im.size[1], im.size[0], 1))
-    return data
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # input is CHW
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
 
-def load_images_RGB(filelist):
-    # pixel value range 0-255
-    if not isinstance(filelist, list):
-        im = Image.open(filelist).convert('RGB')
-        return np.array(im).reshape(1, im.size[1], im.size[0], 3)
-    data = []
-    for file in filelist:
-        im = Image.open(file).convert('RGB')
-        data.append(np.array(im).reshape(1, im.size[1], im.size[0], 3))
-    return data
-
-def save_images(filepath, ground_truth, noisy_image=None, clean_image=None):
-    # assert the pixel value range is 0-255
-    ground_truth = np.squeeze(ground_truth)
-    noisy_image = np.squeeze(noisy_image)
-    clean_image = np.squeeze(clean_image)
-    if not clean_image.any():
-        cat_image = ground_truth
-    else:
-        cat_image = np.concatenate([ground_truth, noisy_image, clean_image], axis=1)
-    im = Image.fromarray(cat_image.astype('uint8')).convert('L')
-    im.save(filepath, 'png')
-
-def save_images_RGB(filepath, ground_truth, noisy_image=None, clean_image=None):
-    # assert the pixel value range is 0-255
-    ground_truth = np.squeeze(ground_truth)
-    noisy_image = np.squeeze(noisy_image)
-    clean_image = np.squeeze(clean_image)
-    if not clean_image.any():
-        cat_image = ground_truth
-    else:
-        cat_image = np.concatenate([ground_truth, noisy_image, clean_image], axis=1)
-    im = Image.fromarray(cat_image.astype('uint8')).convert('RGB')
-    im.save(filepath, 'png')
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        # if you have padding issues, see
+        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
+        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
 
 
-def save_images1(filepath, ground_truth, noisy_image=None, clean_image=None):
-    # assert the pixel value range is 0-255
-    print(np.shape(ground_truth), np.shape(noisy_image), np.shape(clean_image))
-    ground_truth = np.squeeze(ground_truth)
-    noisy_image = np.squeeze(noisy_image)
-    clean_image = np.squeeze(clean_image)
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
 
 
+class MCSURE(nn.Module):
+    def __init__(self, scale):
+        super(MCSURE, self).__init__()
+        self.scale = scale
+        
+    def forward(self, x, out, out_p, sigma, n):
+        B, C, H, W = x.size()
+        eps_inv = get_epsilon(sigma, self.scale) ** (-1)
+        var = (sigma**2).squeeze()
+        
+        # DIVERGENCE
+        tmp = (out_p - out)
+        tmp = torch.einsum("nchw, nchw->nchw", [n, tmp]).view(B, -1)
+        tmp = torch.einsum("n, n, nd->nd", [var, eps_inv, tmp]).sum()
+        divergence = tmp.sum() / (B*H*W*C)
+        
+        # MC-SURE parts
+        pseudo_mse = F.mse_loss(out, x, reduction='mean')
+        var_sum = var.sum() / B
+        
+        # MC-SURE
+        sure = pseudo_mse - var_sum + 2.0*divergence
+        return sure
 
-def cal_psnr(im1, im2):
-    # assert pixel value range is 0-255 and type is uint8
-    mse = ((im1.astype(np.float) - im2.astype(np.float)) ** 2).mean()
-    psnr = 10 * np.log10(255 ** 2 / mse)
-    return psnr
-
-
-def tf_psnr(im1, im2):
-    # assert pixel value range is 0-1
-    mse = tf.losses.mean_squared_error(labels=im2 * 255.0, predictions=im1 * 255.0)
-    return 10.0 * (tf.log(255.0 ** 2 / mse) / tf.log(10.0))
+def get_epsilon(sigma, scale):
+    if scale == 255.:
+        eps = 1e-3*torch.ones(sigma.squeeze().size()).to("cuda")
+    elif scale == 1.:
+        eps = (1.6e-4*255.)*sigma.squeeze()
+    return eps
